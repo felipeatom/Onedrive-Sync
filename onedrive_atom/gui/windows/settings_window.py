@@ -16,6 +16,11 @@ from PyQt6.QtWidgets import (
 from onedrive_atom.config import get_config
 from onedrive_atom.sync.database import get_db
 
+
+def _norm_path(path: str) -> str:
+    """Normalize a remote path for comparison: single leading slash, no trailing slash, lowercase."""
+    return "/" + path.strip("/").lower()
+
 log = logging.getLogger(__name__)
 
 AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "onedrive-sync.desktop"
@@ -391,7 +396,8 @@ class SettingsWindow(QDialog):
         if drive_id != self._selective_current_drive_id:
             return
 
-        selected = set(self._selective_values.get(drive_id, []))
+        # Build a normalized set for case-insensitive, slash-consistent comparison.
+        selected = {_norm_path(p) for p in self._selective_values.get(drive_id, [])}
         self._selective_tree.blockSignals(True)
         if parent_item is None:
             self._selective_tree.clear()
@@ -402,11 +408,12 @@ class SettingsWindow(QDialog):
             self._selective_tree.expandToDepth(0)
         else:
             self._clear_loading_child(parent_item)
-            parent_checked = parent_item.checkState(0) == Qt.CheckState.Checked
+            parent_state = parent_item.checkState(0)
             parent_item.setData(0, Qt.ItemDataRole.UserRole + 2, True)
             for folder in folders:
                 self._add_folder_item(parent_item, folder, selected)
-            if parent_checked:
+            if parent_state == Qt.CheckState.Checked:
+                # Propagate full selection to newly loaded children.
                 self._set_children_check_state(parent_item, Qt.CheckState.Checked)
             self._selective_loading_items.discard(parent_item.data(0, Qt.ItemDataRole.UserRole))
         self._selective_tree.blockSignals(False)
@@ -420,13 +427,31 @@ class SettingsWindow(QDialog):
         QMessageBox.critical(self, "Erro ao carregar árvore", message)
 
     def _add_folder_item(self, parent: QTreeWidgetItem | None, folder: dict, selected: set[str]):
+        """
+        Add a folder item to the tree.
+        `selected` must be a set of _norm_path()-normalized paths.
+        """
         item = QTreeWidgetItem([folder.get("name", "")])
         item.setData(0, Qt.ItemDataRole.UserRole, folder.get("path", ""))
         item.setData(0, Qt.ItemDataRole.UserRole + 1, folder.get("id", ""))
         item.setData(0, Qt.ItemDataRole.UserRole + 2, False)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+
         path = folder.get("path", "")
-        item.setCheckState(0, Qt.CheckState.Checked if path in selected else Qt.CheckState.Unchecked)
+        path_key = _norm_path(path)
+
+        # Determine check state:
+        #   Checked        — this folder's exact path is selected
+        #   PartiallyChecked — a descendant path is selected (lazy-loaded children)
+        #   Unchecked      — neither this folder nor any known descendant is selected
+        if path_key in selected:
+            state = Qt.CheckState.Checked
+        elif any(s.startswith(path_key + "/") for s in selected):
+            state = Qt.CheckState.PartiallyChecked
+        else:
+            state = Qt.CheckState.Unchecked
+
+        item.setCheckState(0, state)
 
         if parent is None:
             self._selective_tree.addTopLevelItem(item)
@@ -436,7 +461,7 @@ class SettingsWindow(QDialog):
         if folder.get("child_count", 0) > 0:
             item.addChild(QTreeWidgetItem(["Carregar subpastas..."]))
 
-        if path in selected:
+        if state == Qt.CheckState.Checked:
             self._set_children_check_state(item, Qt.CheckState.Checked)
         else:
             self._sync_item_check_from_children(item)

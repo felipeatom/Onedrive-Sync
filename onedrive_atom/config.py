@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -131,12 +132,15 @@ class Config:
 
 
 _instance: Config | None = None
+_instance_lock = threading.Lock()
 
 
 def get_config() -> Config:
     global _instance
     if _instance is None:
-        _instance = Config()
+        with _instance_lock:
+            if _instance is None:
+                _instance = Config()
     return _instance
 
 

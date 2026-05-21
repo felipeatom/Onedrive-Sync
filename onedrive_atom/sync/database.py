@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields as dc_fields
 from pathlib import Path
@@ -14,7 +15,17 @@ log = logging.getLogger(__name__)
 
 DB_PATH = DATA_DIR / "sync_state.db"
 
+_SCHEMA_VERSION = 1
+
+# Add new version entries here when schema changes are needed.
+# Keys are target version numbers; values are the SQL to execute.
+_MIGRATIONS: dict[int, str] = {}
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS accounts (
     id          TEXT PRIMARY KEY,
     email       TEXT NOT NULL,
@@ -141,6 +152,14 @@ class Database:
     def _init(self):
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            row = conn.execute("SELECT version FROM schema_version").fetchone()
+            if row is None:
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
+            else:
+                current = row[0]
+                for v in sorted(k for k in _MIGRATIONS if k > current):
+                    conn.executescript(_MIGRATIONS[v])
+                    conn.execute("UPDATE schema_version SET version=?", (v,))
 
     @contextmanager
     def _conn(self):
@@ -303,6 +322,15 @@ class Database:
                 (item_id, drive_id),
             )
 
+    def delete_items_by_local_prefix(self, local_prefix: str):
+        """Delete all items whose local_path equals or is inside local_prefix (folder cascade)."""
+        prefix = local_prefix.rstrip("/")
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM synced_items WHERE local_path = ? OR local_path LIKE ?",
+                (prefix, prefix + "/%"),
+            )
+
     def update_item_status(self, item_id: str, drive_id: str, status: str):
         with self._conn() as conn:
             conn.execute(
@@ -322,10 +350,12 @@ class Database:
                 "SELECT remote_path FROM selective_sync WHERE drive_id=? AND enabled=1 ORDER BY remote_path",
                 (drive_id,),
             ).fetchall()
-            old_paths = [r[0] for r in old_rows]
-            new_paths = sorted(remote_paths)
+            # Normalize stored and new paths for a consistent comparison.
+            old_paths = sorted("/" + r[0].strip("/") for r in old_rows)
+            normalized = ["/" + p.strip("/") for p in remote_paths]
+            new_paths = sorted(normalized)
             conn.execute("DELETE FROM selective_sync WHERE drive_id=?", (drive_id,))
-            for p in remote_paths:
+            for p in normalized:
                 conn.execute(
                     "INSERT OR IGNORE INTO selective_sync (drive_id, remote_path, enabled) VALUES (?,?,1)",
                     (drive_id, p),
@@ -385,10 +415,13 @@ def file_hash(path: Path, block_size: int = 65536) -> str:
 
 
 _db_instance: Database | None = None
+_db_lock = threading.Lock()
 
 
 def get_db() -> Database:
     global _db_instance
     if _db_instance is None:
-        _db_instance = Database()
+        with _db_lock:
+            if _db_instance is None:
+                _db_instance = Database()
     return _db_instance

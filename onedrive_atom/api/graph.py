@@ -228,29 +228,44 @@ class GraphClient:
             self.ensure_folder_by_path(drive_id, parent_path)
         return self.create_folder_by_path(drive_id, remote_path)
 
+    def get_root(self, drive_id: str) -> dict:
+        return self._get(f"/drives/{drive_id}/root")
+
     def download_item(self, drive_id: str, item_id: str, local_path: Path, progress_cb=None):
-        """Download a file to local_path, streaming in chunks."""
+        """Download a file to local_path, streaming in chunks with retry on 429/401."""
         url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content"
-        headers = self._headers()
 
-        with self._session.get(url, headers=headers, stream=True, timeout=60) as resp:
-            if not resp.ok:
-                raise GraphError(resp.status_code, resp.text[:200])
+        for attempt in range(5):
+            headers = self._headers()
+            with self._session.get(url, headers=headers, stream=True, timeout=60) as resp:
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get("Retry-After", 10))
+                    log.warning("Rate limited during download. Waiting %d s.", wait)
+                    time.sleep(wait)
+                    continue
+                if resp.status_code == 401 and attempt == 0:
+                    log.warning("401 during download, refreshing token.")
+                    continue
+                if not resp.ok:
+                    raise GraphError(resp.status_code, resp.text[:200])
 
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = local_path.with_suffix(local_path.suffix + ".part")
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = local_path.with_suffix(local_path.suffix + ".part")
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
 
-            with open(tmp, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_cb and total:
-                            progress_cb(downloaded, total)
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_cb and total:
+                                progress_cb(downloaded, total)
 
-        tmp.replace(local_path)
+                tmp.replace(local_path)
+                return
+
+        raise GraphError(429, "Too many retries during download")
 
     def upload_small(self, drive_id: str, remote_path: str, data: bytes, content_type: str = "application/octet-stream") -> dict:
         encoded = _encode_path(remote_path)
@@ -294,25 +309,37 @@ class GraphClient:
                     "Content-Length": str(len(chunk)),
                     "Content-Type": "application/octet-stream",
                 }
-                resp = self._session.put(upload_url, headers=headers, data=chunk, timeout=120)
 
-                if resp.status_code == 429:
-                    wait = int(resp.headers.get("Retry-After", 10))
-                    time.sleep(wait)
-                    continue
+                for attempt in range(5):
+                    resp = self._session.put(upload_url, headers=headers, data=chunk, timeout=120)
 
-                if resp.status_code not in (200, 201, 202):
-                    raise GraphError(resp.status_code, resp.text[:200])
+                    if resp.status_code == 429:
+                        wait = int(resp.headers.get("Retry-After", 10))
+                        log.warning("Rate limited during upload chunk. Waiting %d s.", wait)
+                        time.sleep(wait)
+                        continue
+
+                    if resp.status_code in (500, 502, 503, 504):
+                        wait = 2 ** attempt
+                        log.warning("Transient %d during upload, retry in %d s.", resp.status_code, wait)
+                        time.sleep(wait)
+                        continue
+
+                    if resp.status_code not in (200, 201, 202):
+                        raise GraphError(resp.status_code, resp.text[:200])
+
+                    if resp.content:
+                        try:
+                            last_response = resp.json()
+                        except Exception:
+                            pass
+                    break
+                else:
+                    raise GraphError(500, f"Failed to upload chunk at offset {uploaded} after 5 attempts")
 
                 uploaded += len(chunk)
                 if progress_cb:
                     progress_cb(uploaded, size)
-
-                if resp.content:
-                    try:
-                        last_response = resp.json()
-                    except Exception:
-                        pass
 
         return last_response
 

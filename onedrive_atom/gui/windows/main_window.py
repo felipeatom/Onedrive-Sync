@@ -91,6 +91,7 @@ class MainWindow(QWidget):
         self.setWindowTitle("Onedrive-Sync")
         self.setMinimumSize(560, 500)
         self._db = get_db()
+        self._activity_initialized = False
         self._build_ui()
 
         self._refresh_timer = QTimer(self)
@@ -196,7 +197,9 @@ class MainWindow(QWidget):
 
     def refresh(self):
         self._refresh_drives()
-        self._refresh_activity()
+        if not self._activity_initialized:
+            self._refresh_activity()
+            self._activity_initialized = True
 
     def set_status(self, text: str):
         self._status_lbl.setText(text)

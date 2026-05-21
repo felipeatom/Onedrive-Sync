@@ -12,32 +12,32 @@ log = logging.getLogger(__name__)
 
 
 class _Handler(FileSystemEventHandler):
-    def __init__(self, callback: Callable[[str, str], None]):
+    def __init__(self, callback: Callable[[str, str, str | None], None]):
         self._callback = callback
 
     def on_created(self, event: FileSystemEvent):
         if not event.is_directory:
-            self._callback(event.src_path, "created")
+            self._callback(event.src_path, "created", None)
 
     def on_modified(self, event: FileSystemEvent):
         if not event.is_directory:
-            self._callback(event.src_path, "modified")
+            self._callback(event.src_path, "modified", None)
 
     def on_deleted(self, event: FileSystemEvent):
-        self._callback(event.src_path, "deleted")
+        self._callback(event.src_path, "deleted", None)
 
     def on_moved(self, event: FileSystemEvent):
-        self._callback(event.src_path, "deleted")
-        self._callback(event.dest_path, "created")
+        self._callback(event.src_path, "moved", event.dest_path)
 
 
 class FileWatcher:
     """
-    Watches one or more directories for changes and calls callback(path, event_type).
-    Event types: 'created', 'modified', 'deleted'.
+    Watches one or more directories for changes and calls callback(path, event_type, dest_path).
+    Event types: 'created', 'modified', 'deleted', 'moved'.
+    dest_path is only set for 'moved' events.
     """
 
-    def __init__(self, callback: Callable[[str, str], None]):
+    def __init__(self, callback: Callable[[str, str, str | None], None]):
         self._callback = callback
         self._observer = Observer()
         self._watched: dict[str, object] = {}  # path -> watch handle

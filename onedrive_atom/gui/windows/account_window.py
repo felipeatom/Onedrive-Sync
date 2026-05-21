@@ -321,7 +321,9 @@ class AccountWindow(QDialog):
             self._code_dialog = None
 
         cfg = get_config()
-        sync_dir = str(Path(cfg.sync_base_dir) / info["email"].split("@")[0])
+        # Use full email (sanitized) to ensure uniqueness across different tenants.
+        safe_email = info["email"].replace("@", "_").replace(".", "_")
+        sync_dir = str(Path(cfg.sync_base_dir) / safe_email)
 
         acc = AccountRecord(
             id=info["account_id"],

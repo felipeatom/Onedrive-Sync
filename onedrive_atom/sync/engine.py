@@ -24,10 +24,22 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class SyncEvent:
-    kind: str  # 'upload' | 'download' | 'delete_remote' | 'delete_local' | 'conflict' | 'error' | 'status'
+    kind: str  # 'upload' | 'download' | 'delete_remote' | 'delete_local' | 'conflict' | 'error' | 'status' | 'syncing' | 'synced'
     path: str = ""
     message: str = ""
     progress: float = 0.0  # 0.0–1.0
+
+
+def _is_path_in_selection(remote_path: str, selected: list[str]) -> bool:
+    """Return True if remote_path falls within any of the selected paths."""
+    if not selected:
+        return True
+    rp = "/" + remote_path.strip("/")
+    for sel in selected:
+        sel_norm = "/" + sel.strip("/")
+        if rp == sel_norm or rp.startswith(sel_norm + "/"):
+            return True
+    return False
 
 
 class SyncEngine:
@@ -42,8 +54,9 @@ class SyncEngine:
         self._db = get_db()
         self._cfg = get_config()
         self._client = GraphClient(account.id)
-        self._local_queue: queue.Queue = queue.Queue()
+        self._local_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue()
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._sync_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -53,6 +66,7 @@ class SyncEngine:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._run,
             name=f"sync-{self.account.email}",
@@ -63,70 +77,86 @@ class SyncEngine:
 
     def stop(self):
         self._stop.set()
+        self._wake.set()  # unblock any ongoing sleep
         if self._thread:
             self._thread.join(timeout=10)
         log.info("Sync engine stopped for %s", self.account.email)
 
-    def enqueue_local_change(self, local_path: str, event_type: str):
+    def enqueue_local_change(self, local_path: str, event_type: str, dest_path: str | None = None):
         """Called by the file watcher when a local change is detected."""
-        self._local_queue.put((local_path, event_type))
+        self._local_queue.put((local_path, event_type, dest_path))
+        self._wake.set()  # Process this change promptly instead of waiting for next poll interval
 
     def sync_now(self):
-        threading.Thread(target=self._sync_now, daemon=True, name=f"sync-now-{self.account.email}").start()
-
-    def _sync_now(self):
-        if self._stop.is_set():
-            return
-        if not self._sync_lock.acquire(blocking=False):
-            log.info("Sync already running for %s", self.account.email)
-            return
-        try:
-            if not self._stop.is_set():
-                self._process_local_changes()
-            if not self._stop.is_set():
-                self._run_delta_sync()
-        finally:
-            self._sync_lock.release()
+        """Wake the sync thread to run a cycle immediately."""
+        self._wake.set()
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _run(self):
+        # Detect files created while the app was offline (only for drives that
+        # have been synced before — fresh installs are handled by _sync_drive).
+        try:
+            for drive in self._db.get_drives(self.account.id):
+                if drive.delta_link and not self._stop.is_set():
+                    self._scan_for_untracked_files(drive)
+        except Exception as e:
+            log.error("Startup local scan failed: %s", e)
+
+        error_count = 0
         while not self._stop.is_set():
             try:
                 with self._sync_lock:
-                    if self._stop.is_set():
-                        break
-                    self._process_local_changes()
-                    if self._stop.is_set():
-                        break
-                    self._run_delta_sync()
+                    if not self._stop.is_set():
+                        self._process_local_changes()
+                    if not self._stop.is_set():
+                        self._run_delta_sync()
+                error_count = 0
             except Exception as e:
+                error_count += 1
                 log.exception("Sync cycle error for %s: %s", self.account.email, e)
                 self._emit(SyncEvent("error", message=str(e)))
 
-            # Wait for next cycle, but wake up immediately for local events
-            self._stop.wait(timeout=self._cfg.sync_interval)
+            if self._stop.is_set():
+                break
+
+            # Exponential backoff on consecutive errors (max 1 hour wait).
+            if error_count:
+                wait = min(self._cfg.sync_interval * (2 ** min(error_count - 1, 4)), 3600)
+            else:
+                wait = self._cfg.sync_interval
+
+            # Only clear the wake flag if the local queue is empty.
+            # _scan_for_untracked_files or enqueue_local_change may have set it
+            # while the sync cycle was running — don't discard those signals.
+            if self._local_queue.empty():
+                self._wake.clear()
+            self._wake.wait(timeout=wait)
 
     def _process_local_changes(self):
-        events: list[tuple[str, str]] = []
+        events: list[tuple[str, str, str | None]] = []
         while True:
             try:
                 events.append(self._local_queue.get_nowait())
             except queue.Empty:
                 break
 
-        for local_path, event_type in events:
+        for local_path, event_type, dest_path in events:
             if self._stop.is_set():
                 break
             try:
-                self._handle_local_event(local_path, event_type)
+                self._handle_local_event(local_path, event_type, dest_path)
             except Exception as e:
                 log.error("Error handling local event %s %s: %s", event_type, local_path, e)
 
-    def _handle_local_event(self, local_path: str, event_type: str):
+    def _handle_local_event(self, local_path: str, event_type: str, dest_path: str | None = None):
         path = Path(local_path)
 
         if self._stop.is_set():
+            return
+
+        if event_type == "moved" and dest_path:
+            self._handle_move(local_path, dest_path)
             return
 
         if self._is_ignored(path):
@@ -139,19 +169,40 @@ class SyncEngine:
 
         if event_type == "deleted":
             if item:
-                if not self._db.is_path_selected(drive.id, item.remote_path):
-                    log.info("DELETE local only (outside selective sync): %s", item.remote_path)
-                    self._db.delete_item(item.item_id, drive.id)
-                    self._db.log_action(self.account.id, drive.id, item.item_id, "delete_local_only", "ok", item.remote_path)
-                    return
+                # Item tracked in DB — delete from OneDrive then clean up DB.
                 log.info("DELETE remote: %s", item.remote_path)
                 self._emit(SyncEvent("delete_remote", path=local_path))
                 try:
                     self._client.delete_item(drive.id, item.item_id)
-                    self._db.delete_item(item.item_id, drive.id)
-                    self._db.log_action(self.account.id, drive.id, item.item_id, "delete_remote", "ok")
                 except GraphError as e:
-                    log.error("Failed to delete remote %s: %s", item.remote_path, e)
+                    if e.status == 404:
+                        log.debug("Already removed from OneDrive: %s", item.remote_path)
+                    else:
+                        log.error("Failed to delete remote %s: %s", item.remote_path, e)
+                # Cascade-delete folder contents from DB so subsequent per-file delete
+                # events don't make redundant API calls for already-deleted items.
+                if item.is_folder:
+                    self._db.delete_items_by_local_prefix(local_path)
+                else:
+                    self._db.delete_item(item.item_id, drive.id)
+                self._db.log_action(self.account.id, drive.id, item.item_id, "delete_remote", "ok", item.remote_path)
+            else:
+                # No DB record — may be an untracked folder (e.g., created via
+                # ensure_folder_by_path during upload) whose children ARE tracked.
+                # Also handles file events that arrive after the parent folder was
+                # already cascade-deleted from the DB.
+                remote_path = self._local_to_remote(local_path, drive)
+                if remote_path:
+                    try:
+                        folder_item = self._client.get_item_by_path(drive.id, remote_path)
+                        self._client.delete_item(drive.id, folder_item.get("id", ""))
+                        self._emit(SyncEvent("delete_remote", path=local_path))
+                        log.info("DELETE remote (untracked folder): %s", remote_path)
+                    except GraphError as e:
+                        if e.status != 404:
+                            log.error("Failed to delete untracked remote %s: %s", remote_path, e)
+                    # Always clean up any orphaned DB children
+                    self._db.delete_items_by_local_prefix(local_path)
             return
 
         if not path.exists():
@@ -162,10 +213,86 @@ class SyncEngine:
             if remote_path is None:
                 return
 
-            if not self._db.is_path_selected(drive.id, remote_path):
+            # Only respect the selective sync filter for files that have already
+            # been synced before (item exists in DB). Locally-created content that
+            # has never been uploaded should always go to OneDrive, regardless of
+            # which paths were selected for download.
+            if item is not None and not self._db.is_path_selected(drive.id, remote_path):
                 return
 
             self._upload_file(drive, path, remote_path, item)
+
+    def _handle_move(self, src_path: str, dest_path: str):
+        """Propagate a local rename/move to the remote using the Graph move API."""
+        dest_p = Path(dest_path)
+
+        if self._is_ignored(dest_p):
+            # Destination is ignored — treat the source as deleted.
+            self._handle_local_event(src_path, "deleted")
+            return
+
+        src_item = self._db.get_item_by_local_path(src_path)
+        drive = self._find_drive_for_path(dest_path) or self._find_drive_for_path(src_path)
+
+        if not src_item or not drive:
+            # Item not tracked or drive unknown — fall back to delete + upload.
+            self._handle_local_event(src_path, "deleted")
+            self._handle_local_event(dest_path, "created")
+            return
+
+        new_remote_path = self._local_to_remote(dest_path, drive)
+        if not new_remote_path:
+            self._handle_local_event(src_path, "deleted")
+            return
+
+        if not self._db.is_path_selected(drive.id, new_remote_path):
+            # Moved outside selective sync — delete remote, no upload.
+            try:
+                self._client.delete_item(drive.id, src_item.item_id)
+                self._db.delete_item(src_item.item_id, drive.id)
+                self._db.log_action(self.account.id, drive.id, src_item.item_id,
+                                    "delete_remote", "ok", f"moved outside selective sync: {src_path}")
+            except GraphError as e:
+                log.error("Failed to delete remote after out-of-scope move: %s", e)
+            return
+
+        new_name = dest_p.name
+        new_parent_remote = new_remote_path.strip("/").rsplit("/", 1)[0] if "/" in new_remote_path.strip("/") else ""
+
+        try:
+            if new_parent_remote:
+                parent_item = self._client.get_item_by_path(drive.id, new_parent_remote)
+                new_parent_id = parent_item.get("id", "")
+            else:
+                root = self._client.get_root(drive.id)
+                new_parent_id = root.get("id", "")
+
+            if not new_parent_id:
+                raise GraphError(404, "Parent folder ID not found")
+
+            self._client.move_item(drive.id, src_item.item_id, new_parent_id, new_name)
+
+            self._db.upsert_item(SyncedItem(
+                item_id=src_item.item_id,
+                drive_id=drive.id,
+                local_path=dest_path,
+                remote_path=new_remote_path,
+                size=src_item.size,
+                local_mtime=dest_p.stat().st_mtime if dest_p.exists() else src_item.local_mtime,
+                remote_mtime=src_item.remote_mtime,
+                local_hash=src_item.local_hash,
+                remote_etag=src_item.remote_etag,
+                sync_status="synced",
+            ))
+            self._db.log_action(self.account.id, drive.id, src_item.item_id, "move", "ok",
+                                f"{src_path} → {dest_path}")
+            self._emit(SyncEvent("upload", path=dest_path,
+                                 message=f"Movido: {Path(src_path).name} → {dest_p.name}"))
+
+        except GraphError as e:
+            log.error("Remote move failed for %s, falling back to delete+upload: %s", src_path, e)
+            self._handle_local_event(src_path, "deleted")
+            self._handle_local_event(dest_path, "created")
 
     def _upload_file(self, drive: DriveRecord, local_path: Path, remote_path: str, existing: SyncedItem | None):
         if local_path.is_dir():
@@ -231,19 +358,35 @@ class SyncEngine:
         delta_link = drive.delta_link or None
         if self._stop.is_set():
             return
-        self._emit(SyncEvent("status", message=f"Syncing {drive.name}…"))
+        self._emit(SyncEvent("syncing", message=f"Sincronizando {drive.name}…"))
 
+        # Cache selected paths once per drive sync cycle to avoid repeated DB queries.
         selected_paths = self._db.get_selective_sync(drive.id)
+
         if selected_paths and not delta_link:
             self._sync_selected_paths(drive, selected_paths)
+            if self._stop.is_set():
+                return
+            # Upload any local-only files that were created while this initial scan ran.
+            self._scan_for_untracked_files(drive)
             if not self._stop.is_set():
                 latest_delta = self._client.get_latest_delta_link(drive.id)
                 if latest_delta:
                     self._db.update_delta_link(drive.id, latest_delta)
-                self._emit(SyncEvent("status", message=f"Synced {drive.name}"))
+                self._emit(SyncEvent("synced", message=f"Sincronizado — {drive.name}"))
             return
 
-        items, new_delta = self._client.get_delta(drive.id, delta_link)
+        try:
+            items, new_delta = self._client.get_delta(drive.id, delta_link)
+        except GraphError as e:
+            if e.status in (410, 400, 404) and delta_link:
+                # Delta token expired or invalid — start a fresh full sync.
+                log.warning("Delta link expired for drive %s (HTTP %d), resetting.", drive.name, e.status)
+                self._db.reset_delta_link(drive.id)
+                items, new_delta = self._client.get_delta(drive.id, None)
+            else:
+                raise
+
         if self._stop.is_set():
             return
         log.debug("Delta for %s: %d items", drive.name, len(items))
@@ -251,18 +394,20 @@ class SyncEngine:
         for remote_item in items:
             if self._stop.is_set():
                 break
-            self._process_remote_item(drive, remote_item)
+            self._process_remote_item(drive, remote_item, selected_paths)
 
         if new_delta and not self._stop.is_set():
             self._db.update_delta_link(drive.id, new_delta)
 
         if not self._stop.is_set():
-            self._emit(SyncEvent("status", message=f"Synced {drive.name}"))
+            self._emit(SyncEvent("synced", message=f"Sincronizado — {drive.name}"))
 
     def _sync_selected_paths(self, drive: DriveRecord, selected_paths: list[str]):
         for remote_path in selected_paths:
             if self._stop.is_set():
                 break
+            # Upload any files the user added while we were scanning previous paths.
+            self._process_local_changes()
             try:
                 item = self._client.get_item_by_path(drive.id, remote_path)
                 self._sync_remote_subtree(drive, item, "/" + remote_path.strip("/"))
@@ -292,20 +437,50 @@ class SyncEngine:
             ))
 
             for child in self._client.list_children(drive.id, remote_item.get("id", "")):
+                if self._stop.is_set():
+                    break
+                # Drain local uploads between children so the user doesn't wait for the
+                # entire tree walk before their newly added files get uploaded.
+                if not self._local_queue.empty():
+                    self._process_local_changes()
                 child_path = f"{remote_path.rstrip('/')}/{child.get('name', '')}"
                 self._sync_remote_subtree(drive, child, child_path)
             return
 
-        self._download_file(drive, remote_item, Path(self._remote_to_local(remote_path, drive)), remote_path)
+        # File — check content before downloading to avoid overwriting an identical local copy.
+        local_p = Path(self._remote_to_local(remote_path, drive))
+        if local_p.exists():
+            remote_sha1 = (remote_item.get("file") or {}).get("hashes", {}).get("sha1Hash", "").lower()
+            if remote_sha1:
+                local_hash = file_hash(local_p)
+                if local_hash == remote_sha1:
+                    existing = self._db.get_item_by_id(remote_item.get("id", ""), drive.id)
+                    self._db.upsert_item(SyncedItem(
+                        item_id=remote_item.get("id", ""),
+                        drive_id=drive.id,
+                        local_path=str(local_p),
+                        remote_path=remote_path,
+                        size=remote_item.get("size", 0),
+                        local_mtime=local_p.stat().st_mtime,
+                        remote_mtime=remote_item.get("lastModifiedDateTime", ""),
+                        local_hash=local_hash,
+                        remote_etag=remote_item.get("eTag", ""),
+                        sync_status="synced",
+                    ))
+                    log.debug("SKIP initial download (content match): %s", local_p)
+                    return
+        self._download_file(drive, remote_item, local_p, remote_path)
 
-    def _process_remote_item(self, drive: DriveRecord, remote_item: dict):
+    def _process_remote_item(self, drive: DriveRecord, remote_item: dict, selected_paths: list[str] | None = None):
         item_id = remote_item.get("id", "")
         remote_path = self._remote_item_path(remote_item)
 
         if self._stop.is_set():
             return
 
-        if not self._db.is_path_selected(drive.id, remote_path):
+        # Use the pre-fetched selection list when available to avoid per-item DB queries.
+        cached = selected_paths if selected_paths is not None else self._db.get_selective_sync(drive.id)
+        if not _is_path_in_selection(remote_path, cached):
             return
 
         # Deleted on remote
@@ -343,28 +518,79 @@ class SyncEngine:
             ))
             return
 
-        # File: check if download needed
+        # File: decide if download is needed
         remote_etag = remote_item.get("eTag", "")
-        remote_mtime = remote_item.get("lastModifiedDateTime", "")
-        size = remote_item.get("size", 0)
 
         if existing and existing.remote_etag == remote_etag:
-            return  # Already up to date
+            return  # eTag unchanged → already up to date
 
         local_p = Path(local_path)
-        conflict = False
+        local_exists = local_p.exists()
+        # Compute local hash once — used for both the content-match check and conflict detection.
+        local_hash = file_hash(local_p) if local_exists else ""
 
-        if existing and local_p.exists():
-            current_hash = file_hash(local_p)
-            if current_hash != existing.local_hash:
-                # Both local and remote changed
-                conflict = True
+        # Content-hash shortcut: compare SHA1 from the Graph API with the local file.
+        # When only metadata (permissions, label, etc.) changed on OneDrive the eTag
+        # updates but file bytes are identical — no download needed.
+        if local_hash:
+            remote_sha1 = (remote_item.get("file") or {}).get("hashes", {}).get("sha1Hash", "").lower()
+            if remote_sha1 and local_hash == remote_sha1:
+                self._db.upsert_item(SyncedItem(
+                    item_id=item_id,
+                    drive_id=drive.id,
+                    local_path=local_path,
+                    remote_path=remote_path,
+                    size=remote_item.get("size", existing.size if existing else 0),
+                    local_mtime=local_p.stat().st_mtime,
+                    remote_mtime=remote_item.get("lastModifiedDateTime", ""),
+                    local_hash=local_hash,
+                    remote_etag=remote_etag,
+                    sync_status="synced",
+                ))
+                log.debug("SKIP download (content match): %s", local_path)
+                return
+
+        # Conflict: eTag changed AND local file also changed since last sync.
+        conflict = existing and local_exists and local_hash != existing.local_hash
 
         if conflict:
             self._handle_conflict(drive, remote_item, local_p, remote_path, existing)
             return
 
         self._download_file(drive, remote_item, local_p, remote_path)
+
+    def _scan_for_untracked_files(self, drive: DriveRecord):
+        """Walk the local sync tree and queue upload for files not tracked in the DB.
+
+        Covers two scenarios:
+        - Files created while the app was not running (missed by the watcher).
+        - Files created during a long initial sync before the watcher enqueued them.
+        """
+        tracked = {item.local_path for item in self._db.get_items_by_drive(drive.id)}
+        drive_local = Path(self.account.sync_dir) / _safe_name(drive.name)
+
+        # Always scan the full drive directory so that locally-created folders outside
+        # the selective-sync selection are also detected and uploaded.  The upload check
+        # in _handle_local_event already allows new (untracked) files to bypass the
+        # selective-sync filter, so scanning wider here is safe.
+        roots = [drive_local]
+
+        count = 0
+        for root in roots:
+            if not root.exists():
+                continue
+            for local_path in root.rglob("*"):
+                if self._stop.is_set():
+                    return
+                if local_path.is_dir() or self._is_ignored(local_path):
+                    continue
+                if str(local_path) not in tracked:
+                    self._local_queue.put((str(local_path), "created", None))
+                    count += 1
+
+        if count:
+            log.info("Local scan queued %d untracked file(s) for upload (%s)", count, drive.name)
+            self._wake.set()
 
     def _download_file(self, drive: DriveRecord, remote_item: dict, local_path: Path, remote_path: str):
         item_id = remote_item.get("id", "")
@@ -528,9 +754,9 @@ class SyncManager:
         if engine:
             engine.stop()
 
-    def enqueue_local_change(self, local_path: str, event_type: str):
+    def enqueue_local_change(self, local_path: str, event_type: str, dest_path: str | None = None):
         for engine in self._engines.values():
-            engine.enqueue_local_change(local_path, event_type)
+            engine.enqueue_local_change(local_path, event_type, dest_path)
 
     def trigger_sync_now(self, account_id: str | None = None):
         targets = ([self._engines[account_id]] if account_id and account_id in self._engines

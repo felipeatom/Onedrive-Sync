@@ -69,8 +69,8 @@ def _run_headless():
 
     manager = SyncManager(status_cb=_status_cb)
 
-    def _on_local_change(path: str, event_type: str):
-        manager.enqueue_local_change(path, event_type)
+    def _on_local_change(path: str, event_type: str, dest_path: str | None = None):
+        manager.enqueue_local_change(path, event_type, dest_path)
 
     watcher = FileWatcher(callback=_on_local_change)
     watcher.start()

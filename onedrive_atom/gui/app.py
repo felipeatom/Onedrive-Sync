@@ -285,10 +285,10 @@ class Application(QObject):
 
     # ── File watcher callback ─────────────────────────────────────────────────
 
-    def _on_local_change(self, path: str, event_type: str):
+    def _on_local_change(self, path: str, event_type: str, dest_path: str | None = None):
         if self._paused:
             return
-        self._sync_manager.enqueue_local_change(path, event_type)
+        self._sync_manager.enqueue_local_change(path, event_type, dest_path)
 
     def _update_watched_dirs(self):
         accounts = self._db.get_accounts()
@@ -313,10 +313,10 @@ class Application(QObject):
             self._tray.set_paused(True)
             return
 
-        if kind == "syncing" or kind == "upload" or kind == "download":
+        if kind in ("syncing", "upload", "download"):
             self._tray.set_state("syncing")
             self._update_main_status("Sincronizando")
-        elif kind == "status" and "Synced" in event.message:
+        elif kind == "synced":
             self._tray.set_state("synced")
             self._update_main_status("Sincronizado")
         elif kind == "status" and event.message:
