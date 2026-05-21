@@ -1,0 +1,20 @@
+[Unit]
+Description=Onedrive-Sync daemon
+Documentation=https://github.com/felipeatom/Onedrive-Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/onedrive-sync --no-gui
+Restart=on-failure
+RestartSec=10
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+# Limits
+LimitNOFILE=65536
+MemoryLimit=256M
+
+[Install]
+WantedBy=default.target

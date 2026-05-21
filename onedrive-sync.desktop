@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Onedrive-Sync
+GenericName=OneDrive Sync Client
+Comment=Sync client for Microsoft OneDrive on Linux
+Exec=onedrive-sync
+Icon=onedrive-sync
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=onedrive;sync;cloud;microsoft;
+StartupNotify=false

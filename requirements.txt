@@ -1,0 +1,6 @@
+msal>=1.26
+requests>=2.31
+watchdog>=4.0
+PyQt6>=6.6
+appdirs>=1.4
+python-dateutil>=2.8
