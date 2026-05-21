@@ -159,6 +159,10 @@ class GraphClient:
 
         return items, delta_link
 
+    def get_latest_delta_link(self, drive_id: str) -> str:
+        data = self._get(f"/drives/{drive_id}/root/delta?token=latest")
+        return data.get("@odata.deltaLink", "")
+
     # ── Items ────────────────────────────────────────────────────────────────
 
     def list_children(self, drive_id: str, item_id: str = "root") -> list[dict]:

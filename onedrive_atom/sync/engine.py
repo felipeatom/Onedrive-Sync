@@ -228,6 +228,16 @@ class SyncEngine:
             return
         self._emit(SyncEvent("status", message=f"Syncing {drive.name}…"))
 
+        selected_paths = self._db.get_selective_sync(drive.id)
+        if selected_paths and not delta_link:
+            self._sync_selected_paths(drive, selected_paths)
+            if not self._stop.is_set():
+                latest_delta = self._client.get_latest_delta_link(drive.id)
+                if latest_delta:
+                    self._db.update_delta_link(drive.id, latest_delta)
+                self._emit(SyncEvent("status", message=f"Synced {drive.name}"))
+            return
+
         items, new_delta = self._client.get_delta(drive.id, delta_link)
         if self._stop.is_set():
             return
@@ -243,6 +253,45 @@ class SyncEngine:
 
         if not self._stop.is_set():
             self._emit(SyncEvent("status", message=f"Synced {drive.name}"))
+
+    def _sync_selected_paths(self, drive: DriveRecord, selected_paths: list[str]):
+        for remote_path in selected_paths:
+            if self._stop.is_set():
+                break
+            try:
+                item = self._client.get_item_by_path(drive.id, remote_path)
+                self._sync_remote_subtree(drive, item, "/" + remote_path.strip("/"))
+            except GraphError as e:
+                log.error("Selected path sync failed %s: %s", remote_path, e)
+                self._db.log_action(self.account.id, drive.id, "", "selective_sync", "error", f"{remote_path}: {e}")
+
+    def _sync_remote_subtree(self, drive: DriveRecord, remote_item: dict, remote_path: str):
+        if self._stop.is_set():
+            return
+
+        remote_item = dict(remote_item)
+        remote_item.setdefault("name", remote_path.strip("/").split("/")[-1])
+
+        if "folder" in remote_item:
+            local_path = self._remote_to_local(remote_path, drive)
+            Path(local_path).mkdir(parents=True, exist_ok=True)
+            self._db.upsert_item(SyncedItem(
+                item_id=remote_item.get("id", ""),
+                drive_id=drive.id,
+                local_path=local_path,
+                remote_path=remote_path,
+                is_folder=True,
+                remote_mtime=remote_item.get("lastModifiedDateTime", ""),
+                remote_etag=remote_item.get("eTag", ""),
+                sync_status="synced",
+            ))
+
+            for child in self._client.list_children(drive.id, remote_item.get("id", "")):
+                child_path = f"{remote_path.rstrip('/')}/{child.get('name', '')}"
+                self._sync_remote_subtree(drive, child, child_path)
+            return
+
+        self._download_file(drive, remote_item, Path(self._remote_to_local(remote_path, drive)), remote_path)
 
     def _process_remote_item(self, drive: DriveRecord, remote_item: dict):
         item_id = remote_item.get("id", "")
