@@ -493,13 +493,19 @@ class SettingsWindow(QDialog):
         if column != 0:
             return
         self._selective_tree.blockSignals(True)
-        self._set_children_check_state(item, item.checkState(0))
+        state = item.checkState(0)
+        if state != Qt.CheckState.PartiallyChecked:
+            self._set_children_check_state(item, state)
         self._update_parent_check(item.parent())
         self._selective_tree.blockSignals(False)
 
     def _set_children_check_state(self, item: QTreeWidgetItem, state: Qt.CheckState):
+        if state == Qt.CheckState.PartiallyChecked:
+            return
         for i in range(item.childCount()):
             child = item.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) is None:
+                continue
             child.setCheckState(0, state)
             self._set_children_check_state(child, state)
 
@@ -512,18 +518,21 @@ class SettingsWindow(QDialog):
             return
         checked = 0
         partial = False
-        for i in range(item.childCount()):
-            state = item.child(i).checkState(0)
+        real_children = [item.child(i) for i in range(item.childCount()) if item.child(i).data(0, Qt.ItemDataRole.UserRole)]
+        for child in real_children:
+            state = child.checkState(0)
             if state == Qt.CheckState.PartiallyChecked:
                 partial = True
             elif state == Qt.CheckState.Checked:
                 checked += 1
 
-        if partial or (0 < checked < item.childCount()):
+        if not real_children:
+            return
+        if partial or (0 < checked < len(real_children)):
             item.setCheckState(0, Qt.CheckState.PartiallyChecked)
-        elif item.childCount() and checked == item.childCount():
+        elif checked == len(real_children):
             item.setCheckState(0, Qt.CheckState.Checked)
-        elif item.childCount():
+        else:
             item.setCheckState(0, Qt.CheckState.Unchecked)
 
         self._update_parent_check(item.parent())
