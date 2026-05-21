@@ -171,20 +171,19 @@ class GraphClient:
             url = data.get("@odata.nextLink")
         return items
 
-    def list_folder_tree(self, drive_id: str, item_id: str = "root", remote_path: str = "") -> list[dict]:
+    def list_folders(self, drive_id: str, item_id: str = "root", remote_path: str = "") -> list[dict]:
         folders = []
         for item in self.list_children(drive_id, item_id):
             if "folder" not in item:
                 continue
             name = item.get("name", "")
             path = f"{remote_path}/{name}".replace("//", "/")
-            folder = {
+            folders.append({
                 "id": item.get("id", ""),
                 "name": name,
                 "path": path,
-                "children": self.list_folder_tree(drive_id, item.get("id", ""), path),
-            }
-            folders.append(folder)
+                "child_count": item.get("folder", {}).get("childCount", 0),
+            })
         return folders
 
     def get_item_by_path(self, drive_id: str, remote_path: str) -> dict:

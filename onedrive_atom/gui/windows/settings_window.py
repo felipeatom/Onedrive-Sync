@@ -31,7 +31,7 @@ X-GNOME-Autostart-enabled=true
 
 
 class SettingsWindow(QDialog):
-    _sig_folder_tree_loaded = pyqtSignal(str, list)
+    _sig_folder_tree_loaded = pyqtSignal(str, object, list)
     _sig_folder_tree_error = pyqtSignal(str)
 
     def __init__(
@@ -52,6 +52,7 @@ class SettingsWindow(QDialog):
         self._selective_current_drive_id: str | None = None
         self._selective_values: dict[str, list[str]] = {}
         self._selective_loading = False
+        self._selective_loading_items: set[str] = set()
         self._build_ui()
         self._sig_folder_tree_loaded.connect(self._on_folder_tree_loaded)
         self._sig_folder_tree_error.connect(self._on_folder_tree_error)
@@ -179,6 +180,7 @@ class SettingsWindow(QDialog):
         self._selective_tree = QTreeWidget()
         self._selective_tree.setHeaderLabels(["Pasta remota"])
         self._selective_tree.itemChanged.connect(self._on_tree_item_changed)
+        self._selective_tree.itemExpanded.connect(self._on_tree_item_expanded)
         right.addWidget(self._selective_tree, 1)
 
         hint = QLabel("Se 'Sincronizar tudo' estiver desmarcado, apenas as pastas marcadas serão sincronizadas.")
@@ -351,6 +353,9 @@ class SettingsWindow(QDialog):
         if not drive_id or self._selective_loading:
             return
 
+        if self._selective_all_cb.isChecked():
+            self._selective_all_cb.setChecked(False)
+
         account_id = None
         for drive in self._db.get_drives(enabled_only=False):
             if drive.id == drive_id:
@@ -369,30 +374,41 @@ class SettingsWindow(QDialog):
         def _load():
             try:
                 from onedrive_atom.api.graph import GraphClient
-                tree = GraphClient(account_id).list_folder_tree(drive_id)
-                self._sig_folder_tree_loaded.emit(drive_id, tree)
+                folders = GraphClient(account_id).list_folders(drive_id)
+                self._sig_folder_tree_loaded.emit(drive_id, None, folders)
             except Exception as e:
                 log.exception("Could not load selective sync tree: %s", e)
                 self._sig_folder_tree_error.emit(str(e))
 
         threading.Thread(target=_load, daemon=True, name="load-selective-tree").start()
 
-    @pyqtSlot(str, list)
-    def _on_folder_tree_loaded(self, drive_id: str, tree: list):
-        self._selective_loading = False
-        self._selective_load_btn.setEnabled(True)
-        self._selective_load_btn.setText("Recarregar árvore")
+    @pyqtSlot(str, object, list)
+    def _on_folder_tree_loaded(self, drive_id: str, parent_item: QTreeWidgetItem | None, folders: list):
+        if parent_item is None:
+            self._selective_loading = False
+            self._selective_load_btn.setEnabled(True)
+            self._selective_load_btn.setText("Recarregar árvore")
         if drive_id != self._selective_current_drive_id:
             return
 
         selected = set(self._selective_values.get(drive_id, []))
         self._selective_tree.blockSignals(True)
-        self._selective_tree.clear()
-        for folder in tree:
-            self._add_folder_item(None, folder, selected)
-        if not tree:
-            self._selective_tree.addTopLevelItem(QTreeWidgetItem(["Nenhuma pasta encontrada na raiz deste drive."]))
-        self._selective_tree.expandToDepth(0)
+        if parent_item is None:
+            self._selective_tree.clear()
+            for folder in folders:
+                self._add_folder_item(None, folder, selected)
+            if not folders:
+                self._selective_tree.addTopLevelItem(QTreeWidgetItem(["Nenhuma pasta encontrada na raiz deste drive."]))
+            self._selective_tree.expandToDepth(0)
+        else:
+            self._clear_loading_child(parent_item)
+            parent_checked = parent_item.checkState(0) == Qt.CheckState.Checked
+            parent_item.setData(0, Qt.ItemDataRole.UserRole + 2, True)
+            for folder in folders:
+                self._add_folder_item(parent_item, folder, selected)
+            if parent_checked:
+                self._set_children_check_state(parent_item, Qt.CheckState.Checked)
+            self._selective_loading_items.discard(parent_item.data(0, Qt.ItemDataRole.UserRole))
         self._selective_tree.blockSignals(False)
         self._update_parent_checks()
 
@@ -406,6 +422,8 @@ class SettingsWindow(QDialog):
     def _add_folder_item(self, parent: QTreeWidgetItem | None, folder: dict, selected: set[str]):
         item = QTreeWidgetItem([folder.get("name", "")])
         item.setData(0, Qt.ItemDataRole.UserRole, folder.get("path", ""))
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, folder.get("id", ""))
+        item.setData(0, Qt.ItemDataRole.UserRole + 2, False)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         path = folder.get("path", "")
         item.setCheckState(0, Qt.CheckState.Checked if path in selected else Qt.CheckState.Unchecked)
@@ -415,13 +433,52 @@ class SettingsWindow(QDialog):
         else:
             parent.addChild(item)
 
-        for child in folder.get("children", []):
-            self._add_folder_item(item, child, selected)
+        if folder.get("child_count", 0) > 0:
+            item.addChild(QTreeWidgetItem(["Carregar subpastas..."]))
 
         if path in selected:
             self._set_children_check_state(item, Qt.CheckState.Checked)
         else:
             self._sync_item_check_from_children(item)
+
+    def _on_tree_item_expanded(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.ItemDataRole.UserRole + 2):
+            return
+        item_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        drive_id = self._selective_current_drive_id
+        if not drive_id or not item_id or path in self._selective_loading_items:
+            return
+
+        account_id = None
+        for drive in self._db.get_drives(enabled_only=False):
+            if drive.id == drive_id:
+                account_id = drive.account_id
+                break
+        if not account_id:
+            return
+
+        self._selective_loading_items.add(path)
+        self._clear_loading_child(item)
+        item.addChild(QTreeWidgetItem(["Carregando subpastas..."]))
+
+        def _load():
+            try:
+                from onedrive_atom.api.graph import GraphClient
+                folders = GraphClient(account_id).list_folders(drive_id, item_id, path)
+                self._sig_folder_tree_loaded.emit(drive_id, item, folders)
+            except Exception as e:
+                log.exception("Could not load selective sync child folders: %s", e)
+                self._selective_loading_items.discard(path)
+                self._sig_folder_tree_error.emit(str(e))
+
+        threading.Thread(target=_load, daemon=True, name="load-selective-children").start()
+
+    def _clear_loading_child(self, item: QTreeWidgetItem):
+        for i in reversed(range(item.childCount())):
+            child = item.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) is None:
+                item.removeChild(child)
 
     def _on_selective_all_toggled(self, _checked: bool):
         self._update_selective_tree_enabled()
