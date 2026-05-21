@@ -534,7 +534,9 @@ class SettingsWindow(QDialog):
         if item.childCount() == 0 or item.checkState(0) == Qt.CheckState.Checked:
             return
 
-        states = [item.child(i).checkState(0) for i in range(item.childCount())]
+        states = [item.child(i).checkState(0) for i in range(item.childCount()) if item.child(i).data(0, Qt.ItemDataRole.UserRole)]
+        if not states:
+            return
         if all(state == Qt.CheckState.Unchecked for state in states):
             item.setCheckState(0, Qt.CheckState.Unchecked)
         elif all(state == Qt.CheckState.Checked for state in states):
@@ -554,17 +556,27 @@ class SettingsWindow(QDialog):
     def _checked_tree_paths(self) -> list[str]:
         paths = []
 
-        def collect(item: QTreeWidgetItem, parent_checked: bool = False):
+        def collect(item: QTreeWidgetItem, parent_checked: bool = False) -> bool:
             state = item.checkState(0)
             path = item.data(0, Qt.ItemDataRole.UserRole)
+            if not path:
+                return False
+
             if state == Qt.CheckState.Checked and not parent_checked:
                 paths.append(path)
-                parent_checked = True
-            elif state != Qt.CheckState.Checked:
-                parent_checked = False
+                return True
 
+            child_selected = False
+            next_parent_checked = parent_checked or state == Qt.CheckState.Checked
             for i in range(item.childCount()):
-                collect(item.child(i), parent_checked)
+                if collect(item.child(i), next_parent_checked):
+                    child_selected = True
+
+            if state == Qt.CheckState.PartiallyChecked and not child_selected and not parent_checked:
+                paths.append(path)
+                return True
+
+            return child_selected
 
         for i in range(self._selective_tree.topLevelItemCount()):
             collect(self._selective_tree.topLevelItem(i))
