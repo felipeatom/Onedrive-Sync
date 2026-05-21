@@ -27,13 +27,37 @@ chmod +x "$BIN_DIR/onedrive-sync"
 DESKTOP_DIR="$HOME/.local/share/applications"
 mkdir -p "$DESKTOP_DIR"
 cp "$SCRIPT_DIR/onedrive-sync.desktop" "$DESKTOP_DIR/"
-update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+chmod +x "$DESKTOP_DIR/onedrive-sync.desktop"
+gio set "$DESKTOP_DIR/onedrive-sync.desktop" metadata::trusted true 2>/dev/null || true
 
 # Install icon into hicolor theme
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 mkdir -p "$ICON_DIR"
 cp "$SCRIPT_DIR/resources/icons/onedrive-sync.svg" "$ICON_DIR/onedrive-sync.svg"
+
+# Install PNG fallbacks because some launchers do not render scalable SVG icons
+# from user icon themes reliably until a full shell restart.
+if command -v rsvg-convert >/dev/null 2>&1; then
+  for size in 32 48 64 128 256 512; do
+    PNG_DIR="$HOME/.local/share/icons/hicolor/${size}x${size}/apps"
+    mkdir -p "$PNG_DIR"
+    rsvg-convert -w "$size" -h "$size" \
+      "$SCRIPT_DIR/resources/icons/onedrive-sync.svg" \
+      -o "$PNG_DIR/onedrive-sync.png"
+  done
+elif [ -d "$SCRIPT_DIR/resources/icons/png" ]; then
+  for png in "$SCRIPT_DIR"/resources/icons/png/onedrive-sync-*.png; do
+    [ -e "$png" ] || continue
+    size="$(basename "$png" | sed -E 's/.*-([0-9]+)\.png/\1/')"
+    PNG_DIR="$HOME/.local/share/icons/hicolor/${size}x${size}/apps"
+    mkdir -p "$PNG_DIR"
+    cp "$png" "$PNG_DIR/onedrive-sync.png"
+  done
+fi
+
+update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+xdg-desktop-menu forceupdate 2>/dev/null || true
 
 # Systemd user service
 SERVICE_DIR="$HOME/.config/systemd/user"

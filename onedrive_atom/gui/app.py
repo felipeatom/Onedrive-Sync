@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 class Application(QObject):
     _sync_event_received = pyqtSignal(str, object)  # account_id, SyncEvent
+    _drive_discovery_finished = pyqtSignal(str, bool, str)  # account_id, ask_sync_mode, error
 
     def __init__(self, qt_app: QApplication, start_minimized: bool = False):
         super().__init__()
@@ -42,6 +43,7 @@ class Application(QObject):
 
         self._wire_signals()
         self._sync_event_received.connect(self._on_sync_event)
+        self._drive_discovery_finished.connect(self._on_drive_discovery_finished)
 
         self._watcher.start()
         self._update_watched_dirs()
@@ -123,14 +125,8 @@ class Application(QObject):
         if not acc:
             return
 
-        self._discover_drives(acc)
-        self._sync_manager.start_account(acc)
-        self._update_watched_dirs()
-
-        if self._main_window:
-            self._main_window.refresh()
-
-        self._tray.show_message("Conta adicionada", f"Conta {acc.email} sincronizando.")
+        self._tray.show_message("Conta adicionada", "Descobrindo drives antes da primeira sincronização.")
+        self._discover_drives(acc, ask_sync_mode=True)
 
     @pyqtSlot(str)
     def _on_account_removed(self, account_id: str):
@@ -148,18 +144,19 @@ class Application(QObject):
 
     # ── Drive discovery ───────────────────────────────────────────────────────
 
-    def _discover_drives(self, account: AccountRecord):
+    def _discover_drives(self, account: AccountRecord, ask_sync_mode: bool = False):
         """Fetches drives from the API and stores them in the database."""
         import threading
         threading.Thread(
             target=self._discover_drives_bg,
-            args=(account,),
+            args=(account, ask_sync_mode),
             daemon=True,
             name=f"discover-{account.email}",
         ).start()
 
-    def _discover_drives_bg(self, account: AccountRecord):
+    def _discover_drives_bg(self, account: AccountRecord, ask_sync_mode: bool = False):
         from onedrive_atom.api.graph import GraphClient, GraphError
+        error = ""
         try:
             client = GraphClient(account.id)
 
@@ -194,7 +191,74 @@ class Application(QObject):
 
             log.info("Drive discovery complete for %s", account.email)
         except GraphError as e:
+            error = str(e)
             log.error("Drive discovery failed for %s: %s", account.email, e)
+        except Exception as e:
+            error = str(e)
+            log.exception("Unexpected drive discovery failure for %s: %s", account.email, e)
+        finally:
+            self._drive_discovery_finished.emit(account.id, ask_sync_mode, error)
+
+    @pyqtSlot(str, bool, str)
+    def _on_drive_discovery_finished(self, account_id: str, ask_sync_mode: bool, error: str):
+        acc = self._db.get_account(account_id)
+        if not acc:
+            return
+
+        if error:
+            QMessageBox.critical(
+                self._main_window,
+                "Erro ao descobrir drives",
+                f"Não foi possível listar os drives da conta {acc.email}:\n\n{error}",
+            )
+            self._db.set_account_enabled(account_id, False)
+            return
+
+        if ask_sync_mode and not self._ask_initial_sync_mode(acc):
+            self._db.set_account_enabled(account_id, False)
+            if self._main_window:
+                self._main_window.refresh()
+            self._tray.show_message("Conta pausada", "A sincronização não foi iniciada.")
+            return
+
+        self._sync_manager.start_account(acc)
+        self._update_watched_dirs()
+
+        if self._main_window:
+            self._main_window.refresh()
+
+        self._tray.show_message("Sincronização iniciada", f"Conta {acc.email} sincronizando.")
+
+    def _ask_initial_sync_mode(self, account: AccountRecord) -> bool:
+        msg = QMessageBox(self._main_window)
+        msg.setWindowTitle("Primeira sincronização")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText("Como deseja sincronizar esta conta?")
+        msg.setInformativeText(
+            "Você pode sincronizar todo o OneDrive agora ou escolher pastas específicas antes de iniciar."
+        )
+        sync_all_btn = msg.addButton("Sincronizar tudo", QMessageBox.ButtonRole.AcceptRole)
+        selective_btn = msg.addButton("Escolher pastas", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = msg.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(selective_btn)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked == cancel_btn:
+            return False
+
+        if clicked == sync_all_btn:
+            for drive in self._db.get_drives(account.id, enabled_only=False):
+                self._db.set_selective_sync(drive.id, [])
+            return True
+
+        dlg = SettingsWindow(
+            self._main_window,
+            start_selective=True,
+            selective_account_id=account.id,
+            force_selective=True,
+        )
+        return dlg.exec() == SettingsWindow.DialogCode.Accepted
 
     # ── File watcher callback ─────────────────────────────────────────────────
 

@@ -5,7 +5,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -34,12 +34,21 @@ class SettingsWindow(QDialog):
     _sig_folder_tree_loaded = pyqtSignal(str, list)
     _sig_folder_tree_error = pyqtSignal(str)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        start_selective: bool = False,
+        selective_account_id: str | None = None,
+        force_selective: bool = False,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Configurações — Onedrive-Sync")
-        self.setMinimumSize(520, 480)
+        self.setMinimumSize(720, 560)
         self._cfg = get_config()
         self._db = get_db()
+        self._start_selective = start_selective
+        self._selective_account_id = selective_account_id
+        self._force_selective = force_selective
         self._selective_current_drive_id: str | None = None
         self._selective_values: dict[str, list[str]] = {}
         self._selective_loading = False
@@ -51,12 +60,12 @@ class SettingsWindow(QDialog):
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._general_tab(), "Geral")
-        tabs.addTab(self._sync_tab(), "Sincronização")
-        tabs.addTab(self._selective_tab(), "Seletiva")
-        tabs.addTab(self._advanced_tab(), "Avançado")
-        layout.addWidget(tabs)
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._general_tab(), "Geral")
+        self._tabs.addTab(self._sync_tab(), "Sincronização")
+        self._tabs.addTab(self._selective_tab(), "Seletiva")
+        self._tabs.addTab(self._advanced_tab(), "Avançado")
+        layout.addWidget(self._tabs)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -234,9 +243,20 @@ class SettingsWindow(QDialog):
             level_map.get(self._cfg.get("log_level", "INFO"), 1)
         )
         self._load_selective_drives()
+        if self._start_selective:
+            self._tabs.setCurrentIndex(2)
 
     def _save_and_close(self):
         self._store_current_selective_paths()
+
+        if self._force_selective and not any(self._selective_values.values()):
+            QMessageBox.warning(
+                self,
+                "Sincronização seletiva",
+                "Selecione pelo menos uma pasta para iniciar a sincronização seletiva.\n\n"
+                "Se quiser sincronizar tudo, volte e escolha 'Sincronizar tudo'.",
+            )
+            return
 
         self._cfg.set("sync_base_dir", self._sync_dir_edit.text())
         self._cfg.set("start_minimized", self._minimized_cb.isChecked())
@@ -279,7 +299,7 @@ class SettingsWindow(QDialog):
         self._selective_drive_list.clear()
         self._selective_values.clear()
 
-        drives = self._db.get_drives(enabled_only=False)
+        drives = self._db.get_drives(self._selective_account_id, enabled_only=False)
         for drive in drives:
             self._selective_values[drive.id] = self._db.get_selective_sync(drive.id)
             item = QListWidgetItem(f"{drive.name}\n{drive.drive_type}")
@@ -310,9 +330,12 @@ class SettingsWindow(QDialog):
         self._selective_all_cb.setEnabled(True)
         self._selective_load_btn.setEnabled(True)
         self._selective_all_cb.blockSignals(True)
-        self._selective_all_cb.setChecked(not self._selective_values.get(drive_id, []))
+        sync_all = not self._selective_values.get(drive_id, []) and not self._force_selective
+        self._selective_all_cb.setChecked(sync_all)
         self._selective_all_cb.blockSignals(False)
         self._update_selective_tree_enabled()
+        if not sync_all:
+            QTimer.singleShot(0, self._load_selected_drive_tree)
 
     def _store_current_selective_paths(self):
         drive_id = self._selective_current_drive_id
@@ -340,6 +363,8 @@ class SettingsWindow(QDialog):
         self._selective_loading = True
         self._selective_load_btn.setEnabled(False)
         self._selective_load_btn.setText("Carregando...")
+        self._selective_tree.clear()
+        self._selective_tree.addTopLevelItem(QTreeWidgetItem(["Carregando pastas..."]))
 
         def _load():
             try:
@@ -365,6 +390,8 @@ class SettingsWindow(QDialog):
         self._selective_tree.clear()
         for folder in tree:
             self._add_folder_item(None, folder, selected)
+        if not tree:
+            self._selective_tree.addTopLevelItem(QTreeWidgetItem(["Nenhuma pasta encontrada na raiz deste drive."]))
         self._selective_tree.expandToDepth(0)
         self._selective_tree.blockSignals(False)
         self._update_parent_checks()
