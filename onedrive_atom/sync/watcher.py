@@ -16,8 +16,7 @@ class _Handler(FileSystemEventHandler):
         self._callback = callback
 
     def on_created(self, event: FileSystemEvent):
-        if not event.is_directory:
-            self._callback(event.src_path, "created", None)
+        self._callback(event.src_path, "created", None)
 
     def on_modified(self, event: FileSystemEvent):
         if not event.is_directory:

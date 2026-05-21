@@ -220,7 +220,10 @@ class SyncEngine:
             if item is not None and not self._db.is_path_selected(drive.id, remote_path):
                 return
 
-            self._upload_file(drive, path, remote_path, item)
+            if path.is_dir():
+                self._ensure_remote_dir(drive, path, remote_path)
+            else:
+                self._upload_file(drive, path, remote_path, item)
 
     def _handle_move(self, src_path: str, dest_path: str):
         """Propagate a local rename/move to the remote using the Graph move API."""
@@ -293,6 +296,29 @@ class SyncEngine:
             log.error("Remote move failed for %s, falling back to delete+upload: %s", src_path, e)
             self._handle_local_event(src_path, "deleted")
             self._handle_local_event(dest_path, "created")
+
+    def _ensure_remote_dir(self, drive: DriveRecord, local_path: Path, remote_path: str):
+        """Create a directory on OneDrive and record it in the DB if not already tracked."""
+        if self._db.get_item_by_local_path(str(local_path)):
+            return  # Already tracked — nothing to do
+        try:
+            result = self._client.ensure_folder_by_path(drive.id, remote_path)
+            if result:
+                self._db.upsert_item(SyncedItem(
+                    item_id=result.get("id", ""),
+                    drive_id=drive.id,
+                    local_path=str(local_path),
+                    remote_path=remote_path,
+                    is_folder=True,
+                    remote_mtime=result.get("lastModifiedDateTime", ""),
+                    remote_etag=result.get("eTag", ""),
+                    sync_status="synced",
+                ))
+                self._db.log_action(self.account.id, drive.id, result.get("id", ""), "mkdir", "ok", remote_path)
+                self._emit(SyncEvent("upload", path=str(local_path), message=f"Pasta criada: {local_path.name}"))
+                log.info("MKDIR remote: %s", remote_path)
+        except GraphError as e:
+            log.error("Failed to create remote dir %s: %s", remote_path, e)
 
     def _upload_file(self, drive: DriveRecord, local_path: Path, remote_path: str, existing: SyncedItem | None):
         if local_path.is_dir():
@@ -582,10 +608,22 @@ class SyncEngine:
             for local_path in root.rglob("*"):
                 if self._stop.is_set():
                     return
-                if local_path.is_dir() or self._is_ignored(local_path):
+                if self._is_ignored(local_path):
                     continue
-                if str(local_path) not in tracked:
-                    self._local_queue.put((str(local_path), "created", None))
+                path_str = str(local_path)
+                if path_str in tracked:
+                    continue
+                if local_path.is_dir():
+                    # Queue empty directories — non-empty ones will be created
+                    # automatically via ensure_folder_by_path when their files upload.
+                    try:
+                        if not any(True for _ in local_path.iterdir()):
+                            self._local_queue.put((path_str, "created", None))
+                            count += 1
+                    except OSError:
+                        pass
+                else:
+                    self._local_queue.put((path_str, "created", None))
                     count += 1
 
         if count:
