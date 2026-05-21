@@ -235,6 +235,13 @@ class Database:
                 (delta_link, drive_id),
             )
 
+    def reset_delta_link(self, drive_id: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE drives SET delta_link='', last_sync=NULL WHERE id=?",
+                (drive_id,),
+            )
+
     def set_drive_enabled(self, drive_id: str, enabled: bool):
         with self._conn() as conn:
             conn.execute("UPDATE drives SET enabled=? WHERE id=?", (int(enabled), drive_id))
@@ -307,12 +314,20 @@ class Database:
 
     def set_selective_sync(self, drive_id: str, remote_paths: list[str]):
         with self._conn() as conn:
+            old_rows = conn.execute(
+                "SELECT remote_path FROM selective_sync WHERE drive_id=? AND enabled=1 ORDER BY remote_path",
+                (drive_id,),
+            ).fetchall()
+            old_paths = [r[0] for r in old_rows]
+            new_paths = sorted(remote_paths)
             conn.execute("DELETE FROM selective_sync WHERE drive_id=?", (drive_id,))
             for p in remote_paths:
                 conn.execute(
                     "INSERT OR IGNORE INTO selective_sync (drive_id, remote_path, enabled) VALUES (?,?,1)",
                     (drive_id, p),
                 )
+            if old_paths != new_paths:
+                conn.execute("UPDATE drives SET delta_link='', last_sync=NULL WHERE id=?", (drive_id,))
 
     def get_selective_sync(self, drive_id: str) -> list[str]:
         with self._conn() as conn:

@@ -235,6 +235,8 @@ class Application(QObject):
         else:
             self._sync_manager.start_account(acc)
             self._update_watched_dirs()
+            if ask_sync_mode:
+                self._sync_manager.trigger_sync_now(account_id)
 
         if self._main_window:
             self._main_window.refresh()
@@ -262,6 +264,7 @@ class Application(QObject):
         if clicked == sync_all_btn:
             for drive in self._db.get_drives(account.id, enabled_only=False):
                 self._db.set_selective_sync(drive.id, [])
+                self._db.reset_delta_link(drive.id)
             return True
 
         dlg = SettingsWindow(
@@ -270,7 +273,11 @@ class Application(QObject):
             selective_account_id=account.id,
             force_selective=True,
         )
-        return dlg.exec() == SettingsWindow.DialogCode.Accepted
+        accepted = dlg.exec() == SettingsWindow.DialogCode.Accepted
+        if accepted:
+            for drive in self._db.get_drives(account.id, enabled_only=False):
+                self._db.reset_delta_link(drive.id)
+        return accepted
 
     # ── File watcher callback ─────────────────────────────────────────────────
 
