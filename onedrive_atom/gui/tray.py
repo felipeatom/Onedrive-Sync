@@ -106,8 +106,8 @@ class TrayIcon(QSystemTrayIcon):
 
     def _toggle_pause(self):
         self._paused = not self._paused
-        self.pause_requested.emit(self._paused)
         self.set_paused(self._paused)
+        self.pause_requested.emit(self._paused)
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:

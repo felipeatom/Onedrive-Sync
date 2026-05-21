@@ -50,6 +50,8 @@ class SyncEngine:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            return
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -73,12 +75,16 @@ class SyncEngine:
         threading.Thread(target=self._sync_now, daemon=True, name=f"sync-now-{self.account.email}").start()
 
     def _sync_now(self):
+        if self._stop.is_set():
+            return
         if not self._sync_lock.acquire(blocking=False):
             log.info("Sync already running for %s", self.account.email)
             return
         try:
-            self._process_local_changes()
-            self._run_delta_sync()
+            if not self._stop.is_set():
+                self._process_local_changes()
+            if not self._stop.is_set():
+                self._run_delta_sync()
         finally:
             self._sync_lock.release()
 
@@ -88,7 +94,11 @@ class SyncEngine:
         while not self._stop.is_set():
             try:
                 with self._sync_lock:
+                    if self._stop.is_set():
+                        break
                     self._process_local_changes()
+                    if self._stop.is_set():
+                        break
                     self._run_delta_sync()
             except Exception as e:
                 log.exception("Sync cycle error for %s: %s", self.account.email, e)
@@ -106,6 +116,8 @@ class SyncEngine:
                 break
 
         for local_path, event_type in events:
+            if self._stop.is_set():
+                break
             try:
                 self._handle_local_event(local_path, event_type)
             except Exception as e:
@@ -113,6 +125,9 @@ class SyncEngine:
 
     def _handle_local_event(self, local_path: str, event_type: str):
         path = Path(local_path)
+
+        if self._stop.is_set():
+            return
 
         if self._is_ignored(path):
             return
@@ -167,10 +182,14 @@ class SyncEngine:
             self._emit(SyncEvent("upload", path=str(local_path), progress=done / total))
 
         try:
+            if self._stop.is_set():
+                return
             parent_remote = remote_path.strip("/").rsplit("/", 1)[0]
             if parent_remote:
                 self._client.ensure_folder_by_path(drive.id, parent_remote)
             result = self._client.upload_file(drive.id, remote_path, local_path, _progress)
+            if self._stop.is_set():
+                return
             item_id = result.get("id", existing.item_id if existing else "")
             mtime = local_path.stat().st_mtime
 
@@ -196,6 +215,8 @@ class SyncEngine:
     def _run_delta_sync(self):
         drives = self._db.get_drives(self.account.id)
         for drive in drives:
+            if self._stop.is_set():
+                break
             try:
                 self._sync_drive(drive)
             except Exception as e:
@@ -203,22 +224,32 @@ class SyncEngine:
 
     def _sync_drive(self, drive: DriveRecord):
         delta_link = drive.delta_link or None
+        if self._stop.is_set():
+            return
         self._emit(SyncEvent("status", message=f"Syncing {drive.name}…"))
 
         items, new_delta = self._client.get_delta(drive.id, delta_link)
+        if self._stop.is_set():
+            return
         log.debug("Delta for %s: %d items", drive.name, len(items))
 
         for remote_item in items:
+            if self._stop.is_set():
+                break
             self._process_remote_item(drive, remote_item)
 
-        if new_delta:
+        if new_delta and not self._stop.is_set():
             self._db.update_delta_link(drive.id, new_delta)
 
-        self._emit(SyncEvent("status", message=f"Synced {drive.name}"))
+        if not self._stop.is_set():
+            self._emit(SyncEvent("status", message=f"Synced {drive.name}"))
 
     def _process_remote_item(self, drive: DriveRecord, remote_item: dict):
         item_id = remote_item.get("id", "")
         remote_path = self._remote_item_path(remote_item)
+
+        if self._stop.is_set():
+            return
 
         if not self._db.is_path_selected(drive.id, remote_path):
             return
@@ -290,7 +321,11 @@ class SyncEngine:
             self._emit(SyncEvent("download", path=str(local_path), progress=done / total))
 
         try:
+            if self._stop.is_set():
+                return
             self._client.download_item(drive.id, item_id, local_path, _progress)
+            if self._stop.is_set():
+                return
             mtime = local_path.stat().st_mtime
             local_hash = file_hash(local_path)
 
@@ -430,7 +465,7 @@ class SyncManager:
         engine.start()
 
     def stop_all(self):
-        for engine in self._engines.values():
+        for engine in list(self._engines.values()):
             engine.stop()
         self._engines.clear()
 

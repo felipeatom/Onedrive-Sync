@@ -29,6 +29,7 @@ class Application(QObject):
         self._start_minimized = start_minimized
         self._cfg = get_config()
         self._db = get_db()
+        self._paused = False
 
         self._main_window: MainWindow | None = None
         self._account_window: AccountWindow | None = None
@@ -104,16 +105,24 @@ class Application(QObject):
 
     @pyqtSlot(bool)
     def _set_paused(self, paused: bool):
+        self._paused = paused
         if paused:
             self._sync_manager.stop_all()
             self._watcher.stop()
+            self._tray.set_paused(True)
+            self._tray.show_message("Sincronização pausada", "Nenhum arquivo será enviado ou baixado até retomar.")
         else:
             self._watcher.start()
             self._update_watched_dirs()
             self._sync_manager.start_all()
+            self._tray.set_paused(False)
+            self._tray.show_message("Sincronização retomada", "O monitoramento de arquivos foi reativado.")
 
     @pyqtSlot()
     def _sync_now(self):
+        if self._paused:
+            self._tray.show_message("Sincronização pausada", "Retome a sincronização antes de sincronizar agora.")
+            return
         self._sync_manager.trigger_sync_now()
         self._tray.set_state("syncing")
 
@@ -137,7 +146,7 @@ class Application(QObject):
     def _on_account_toggled(self, account_id: str, enabled: bool):
         if enabled:
             acc = self._db.get_account(account_id)
-            if acc:
+            if acc and not self._paused:
                 self._sync_manager.start_account(acc)
         else:
             self._sync_manager.stop_account(account_id)
@@ -221,8 +230,11 @@ class Application(QObject):
             self._tray.show_message("Conta pausada", "A sincronização não foi iniciada.")
             return
 
-        self._sync_manager.start_account(acc)
-        self._update_watched_dirs()
+        if self._paused:
+            self._tray.show_message("Conta pronta", "A conta foi configurada, mas a sincronização está pausada.")
+        else:
+            self._sync_manager.start_account(acc)
+            self._update_watched_dirs()
 
         if self._main_window:
             self._main_window.refresh()
@@ -263,6 +275,8 @@ class Application(QObject):
     # ── File watcher callback ─────────────────────────────────────────────────
 
     def _on_local_change(self, path: str, event_type: str):
+        if self._paused:
+            return
         self._sync_manager.enqueue_local_change(path, event_type)
 
     def _update_watched_dirs(self):
@@ -281,6 +295,12 @@ class Application(QObject):
     def _on_sync_event(self, account_id: str, event: SyncEvent):
         cfg = self._cfg
         kind = event.kind
+
+        if self._paused:
+            if self._main_window and self._main_window.isVisible() and kind == "error":
+                self._main_window.add_activity(event.message, is_error=True)
+            self._tray.set_paused(True)
+            return
 
         if kind == "syncing" or kind == "upload" or kind == "download":
             self._tray.set_state("syncing")
@@ -310,7 +330,7 @@ class Application(QObject):
         # Update tray to synced after a brief delay (debounce)
         if kind in ("upload", "download"):
             from PyQt6.QtCore import QTimer
-            QTimer.singleShot(3000, lambda: self._tray.set_state("synced"))
+            QTimer.singleShot(3000, lambda: None if self._paused else self._tray.set_state("synced"))
 
     # ── Quit ──────────────────────────────────────────────────────────────────
 
