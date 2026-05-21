@@ -139,6 +139,11 @@ class SyncEngine:
 
         if event_type == "deleted":
             if item:
+                if not self._db.is_path_selected(drive.id, item.remote_path):
+                    log.info("DELETE local only (outside selective sync): %s", item.remote_path)
+                    self._db.delete_item(item.item_id, drive.id)
+                    self._db.log_action(self.account.id, drive.id, item.item_id, "delete_local_only", "ok", item.remote_path)
+                    return
                 log.info("DELETE remote: %s", item.remote_path)
                 self._emit(SyncEvent("delete_remote", path=local_path))
                 try:

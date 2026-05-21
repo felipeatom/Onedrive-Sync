@@ -310,6 +310,10 @@ class Database:
                 (status, item_id, drive_id),
             )
 
+    def forget_item_by_local_path(self, local_path: str):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM synced_items WHERE local_path=?", (local_path,))
+
     # ── Selective sync ────────────────────────────────────────────────────────
 
     def set_selective_sync(self, drive_id: str, remote_paths: list[str]):
