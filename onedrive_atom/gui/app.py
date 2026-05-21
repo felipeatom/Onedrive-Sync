@@ -81,6 +81,7 @@ class Application(QObject):
             self._main_window.open_accounts_requested.connect(self._show_accounts)
             self._main_window.open_settings_requested.connect(self._show_settings)
 
+        self._update_main_status()
         self._main_window.refresh()
         self._main_window.show()
         self._main_window.raise_()
@@ -110,12 +111,14 @@ class Application(QObject):
             self._sync_manager.stop_all()
             self._watcher.stop()
             self._tray.set_paused(True)
+            self._update_main_status("Pausado")
             self._tray.show_message("Sincronização pausada", "Nenhum arquivo será enviado ou baixado até retomar.")
         else:
             self._watcher.start()
             self._update_watched_dirs()
             self._sync_manager.start_all()
             self._tray.set_paused(False)
+            self._update_main_status("Sincronizando")
             self._tray.show_message("Sincronização retomada", "O monitoramento de arquivos foi reativado.")
 
     @pyqtSlot()
@@ -125,6 +128,7 @@ class Application(QObject):
             return
         self._sync_manager.trigger_sync_now()
         self._tray.set_state("syncing")
+        self._update_main_status("Sincronizando")
 
     # ── Account events ────────────────────────────────────────────────────────
 
@@ -311,10 +315,15 @@ class Application(QObject):
 
         if kind == "syncing" or kind == "upload" or kind == "download":
             self._tray.set_state("syncing")
+            self._update_main_status("Sincronizando")
         elif kind == "status" and "Synced" in event.message:
             self._tray.set_state("synced")
+            self._update_main_status("Sincronizado")
+        elif kind == "status" and event.message:
+            self._update_main_status(event.message)
         elif kind == "error":
             self._tray.set_state("error")
+            self._update_main_status("Erro")
             if cfg.get("notifications_enabled", True):
                 self._tray.show_message(
                     "Erro de sincronização",
@@ -331,13 +340,36 @@ class Application(QObject):
 
         if self._main_window and self._main_window.isVisible():
             is_err = kind == "error"
-            msg = event.message or f"{kind}: {Path(event.path).name}" if event.path else kind
+            if event.message:
+                msg = event.message
+            elif event.path:
+                msg = f"{kind}: {Path(event.path).name}"
+            else:
+                msg = kind
             self._main_window.add_activity(msg, is_error=is_err)
 
         # Update tray to synced after a brief delay (debounce)
         if kind in ("upload", "download"):
             from PyQt6.QtCore import QTimer
-            QTimer.singleShot(3000, lambda: None if self._paused else self._tray.set_state("synced"))
+            QTimer.singleShot(3000, self._mark_synced_if_active)
+
+    def _mark_synced_if_active(self):
+        if self._paused:
+            return
+        self._tray.set_state("synced")
+        self._update_main_status("Sincronizado")
+
+    def _update_main_status(self, status: str | None = None):
+        if not self._main_window:
+            return
+        if status is None:
+            if self._paused:
+                status = "Pausado"
+            elif self._db.get_accounts():
+                status = "Sincronizando"
+            else:
+                status = "Offline"
+        self._main_window.set_status(status)
 
     # ── Quit ──────────────────────────────────────────────────────────────────
 
