@@ -169,6 +169,15 @@ class SyncEngine:
 
         if event_type == "deleted":
             if item:
+                if not self._db.is_path_selected(drive.id, item.remote_path):
+                    log.info("DELETE local only (outside selective sync): %s", item.remote_path)
+                    if item.is_folder:
+                        self._db.delete_items_by_local_prefix(local_path)
+                    else:
+                        self._db.delete_item(item.item_id, drive.id)
+                    self._db.log_action(self.account.id, drive.id, item.item_id, "delete_local_only", "ok", item.remote_path)
+                    return
+
                 # Item tracked in DB — delete from OneDrive then clean up DB.
                 log.info("DELETE remote: %s", item.remote_path)
                 self._emit(SyncEvent("delete_remote", path=local_path))
@@ -193,6 +202,9 @@ class SyncEngine:
                 # already cascade-deleted from the DB.
                 remote_path = self._local_to_remote(local_path, drive)
                 if remote_path:
+                    if not self._db.is_path_selected(drive.id, remote_path):
+                        self._db.delete_items_by_local_prefix(local_path)
+                        return
                     try:
                         folder_item = self._client.get_item_by_path(drive.id, remote_path)
                         self._client.delete_item(drive.id, folder_item.get("id", ""))
@@ -213,11 +225,7 @@ class SyncEngine:
             if remote_path is None:
                 return
 
-            # Only respect the selective sync filter for files that have already
-            # been synced before (item exists in DB). Locally-created content that
-            # has never been uploaded should always go to OneDrive, regardless of
-            # which paths were selected for download.
-            if item is not None and not self._db.is_path_selected(drive.id, remote_path):
+            if not self._db.is_path_selected(drive.id, remote_path):
                 return
 
             if path.is_dir():
@@ -249,14 +257,14 @@ class SyncEngine:
             return
 
         if not self._db.is_path_selected(drive.id, new_remote_path):
-            # Moved outside selective sync — delete remote, no upload.
-            try:
-                self._client.delete_item(drive.id, src_item.item_id)
+            # Moving a local item outside the selected tree makes it local-only.
+            # Keep the OneDrive item intact and only forget the old local mapping.
+            if src_item.is_folder:
+                self._db.delete_items_by_local_prefix(src_path)
+            else:
                 self._db.delete_item(src_item.item_id, drive.id)
-                self._db.log_action(self.account.id, drive.id, src_item.item_id,
-                                    "delete_remote", "ok", f"moved outside selective sync: {src_path}")
-            except GraphError as e:
-                log.error("Failed to delete remote after out-of-scope move: %s", e)
+            self._db.log_action(self.account.id, drive.id, src_item.item_id,
+                                "move_local_only", "ok", f"moved outside selective sync: {src_path}")
             return
 
         new_name = dest_p.name
@@ -595,11 +603,8 @@ class SyncEngine:
         tracked = {item.local_path for item in self._db.get_items_by_drive(drive.id)}
         drive_local = Path(self.account.sync_dir) / _safe_name(drive.name)
 
-        # Always scan the full drive directory so that locally-created folders outside
-        # the selective-sync selection are also detected and uploaded.  The upload check
-        # in _handle_local_event already allows new (untracked) files to bypass the
-        # selective-sync filter, so scanning wider here is safe.
-        roots = [drive_local]
+        selected_paths = self._db.get_selective_sync(drive.id)
+        roots = [Path(self._remote_to_local(p, drive)) for p in selected_paths] if selected_paths else [drive_local]
 
         count = 0
         for root in roots:
